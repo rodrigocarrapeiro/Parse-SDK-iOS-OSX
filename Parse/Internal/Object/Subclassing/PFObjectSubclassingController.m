@@ -113,7 +113,7 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
 - (Class<PFSubclassing>)subclassForParseClassName:(NSString *)parseClassName {
     __block Class result = nil;
     pf_sync_with_throw(_registeredSubclassesAccessQueue, ^{
-        result = [_registeredSubclasses[parseClassName] subclass];
+        result = [self->_registeredSubclasses[parseClassName] subclass];
     });
     return result;
 }
@@ -128,20 +128,12 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
                                                                                             queue:nil
                                                                                        usingBlock:^(NSNotification *note) {
                                                                                            @strongify(self);
-                                                                                           [self _registerSubclassesInBundle:note.object];
+                                                                                           [self _registerSubclassesInLoadedBundle:note.object];
                                                                                        }];
     }
     NSArray *bundles = [[NSBundle allFrameworks] arrayByAddingObjectsFromArray:[NSBundle allBundles]];
     for (NSBundle *bundle in bundles) {
-        // Skip bundles that aren't loaded yet.
-        if (!bundle.loaded || !bundle.executablePath) {
-            continue;
-        }
-        // Filter out any system bundles
-        if ([bundle.bundlePath hasPrefix:@"/System/"] || [bundle.bundlePath hasPrefix:@"/Library/"]) {
-            continue;
-        }
-        [self _registerSubclassesInBundle:bundle];
+        [self _registerSubclassesInLoadedBundle:bundle];
     }
 }
 
@@ -154,7 +146,7 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
 - (void)unregisterSubclass:(Class<PFSubclassing>)class {
     pf_sync_with_throw(_registeredSubclassesAccessQueue, ^{
         NSString *parseClassName = [class parseClassName];
-        Class registeredClass = [_registeredSubclasses[parseClassName] subclass];
+        Class registeredClass = [self->_registeredSubclasses[parseClassName] subclass];
 
         // Make it a no-op if the class itself is not registered or
         // if there is another class registered under the same name.
@@ -163,7 +155,7 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
             return;
         }
 
-        [_registeredSubclasses removeObjectForKey:parseClassName];
+        [self->_registeredSubclasses removeObjectForKey:parseClassName];
     });
 }
 
@@ -276,13 +268,13 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
     __block PFObjectSubclassInfo *result = nil;
     pf_sync_with_throw(_registeredSubclassesAccessQueue, ^{
         if (class_respondsToSelector(object_getClass(kls), @selector(parseClassName))) {
-            result = _registeredSubclasses[[kls parseClassName]];
+            result = self->_registeredSubclasses[[kls parseClassName]];
         }
 
         // TODO: (nlutsenko, richardross) Don't let unregistered subclasses have dynamic property resolution.
         if (!result) {
             result = [PFObjectSubclassInfo subclassInfoWithSubclass:kls];
-            _unregisteredSubclasses[NSStringFromClass(kls)] = result;
+            self->_unregisteredSubclasses[NSStringFromClass(kls)] = result;
         }
     });
     return result;
@@ -338,8 +330,35 @@ static NSNumber *PFNumberCreateSafe(const char *typeEncoding, const void *bytes)
     _registeredSubclasses[[kls parseClassName]] = subclassInfo;
 }
 
+- (void)_registerSubclassesInLoadedBundle:(NSBundle *)bundle {
+    // Skip bundles that aren't loaded yet.
+    if (![bundle isKindOfClass:NSBundle.class] || !bundle.loaded || !bundle.executablePath) {
+        return;
+    }
+    // Filter out any system bundles
+    if ([bundle.bundlePath hasPrefix:@"/System/"] || [bundle.bundlePath rangeOfString:@"iPhoneSimulator.sdk"].location != NSNotFound) {
+        return;
+    }
+    
+    // Because the Parse Framework cannot be bundled with a macOS Command Line Application, the Parse Framework will need to be
+    // external to the application. Per Apple's Framework Programming Guide,
+    // https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPFrameworks/Tasks/InstallingFrameworks.html#//apple_ref/doc/uid/20002261-97286
+    // the preferred file-system location would be /Library/Frameworks
+    // In these cases, we will not want to filter out the Parse.framework if it is installed in /Library/Frameworks.
+    if ([bundle.bundlePath hasPrefix:@"/Library/"]) {
+
+        if ([bundle.bundlePath hasPrefix:@"/Library/Frameworks/"] && [[bundle.bundlePath lastPathComponent] isEqualToString:@"Parse.framework"]) {
+            [self _registerSubclassesInBundle:bundle]; // Handle case where Parse.framework is installed in /Library/Frameworks
+        }
+        
+        return;
+    }
+    
+    [self _registerSubclassesInBundle:bundle];
+}
+
 - (void)_registerSubclassesInBundle:(NSBundle *)bundle {
-    PFConsistencyAssert(bundle.loaded, @"Cannot register subclasses in a bundle that hasn't been loaded!");
+    PFConsistencyAssert(bundle.loaded, @"Cannot register subclasses in an unloaded bundle: %@", bundle);
 
     const char *executablePath = bundle.executablePath.UTF8String;
     if (executablePath == NULL) {
